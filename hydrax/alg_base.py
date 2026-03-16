@@ -123,7 +123,7 @@ class SamplingBasedController(ABC):
                 {key: 0 for key in randomizations.keys()}
             )
 
-    def optimize(self, state: mjx.Data, params: Any) -> Tuple[Any, Trajectory]:
+    def optimize(self, state: mjx.Data, params: Any, q_goal) -> Tuple[Any, Trajectory]:
         """Perform an optimization step to update the policy parameters.
 
         Args:
@@ -143,6 +143,8 @@ class SamplingBasedController(ABC):
         new_mean = self.interp_func(new_tk, tk, params.mean[None, ...])[0]
         params = params.replace(tk=new_tk, mean=new_mean)
 
+        q_goal = jnp.array(q_goal)
+
         def _optimize_scan_body(params: Any, _: Any):
             # Sample random control sequences from spline knots
             knots, params = self.sample_knots(params)
@@ -154,7 +156,7 @@ class SamplingBasedController(ABC):
             # combining costs using self.risk_strategy.
             rng, dr_rng = jax.random.split(params.rng)
             rollouts = self.rollout_with_randomizations(
-                state, new_tk, knots, dr_rng
+                state, new_tk, knots, dr_rng, q_goal
             )
             params = params.replace(rng=rng)
 
@@ -177,6 +179,7 @@ class SamplingBasedController(ABC):
         tk: jax.Array,
         knots: jax.Array,
         rng: jax.Array,
+        q_goal: jax.Array
     ) -> Trajectory:
         """Compute rollout costs, applying domain randomizations.
 
@@ -210,8 +213,8 @@ class SamplingBasedController(ABC):
         # Apply the control sequences, parallelized over both rollouts and
         # domain randomizations.
         _, rollouts = jax.vmap(
-            self.eval_rollouts, in_axes=(self.randomized_axes, 0, None, None)
-        )(self.model, states, controls, knots)
+            self.eval_rollouts, in_axes=(self.randomized_axes, 0, None, None, None)
+        )(self.model, states, controls, knots, q_goal)
 
         # Combine the costs from different domain randomizations using the
         # specified risk strategy.
@@ -223,13 +226,14 @@ class SamplingBasedController(ABC):
             costs=costs, controls=controls, knots=knots, trace_sites=trace_sites
         )
 
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0))
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None))
     def eval_rollouts(
         self,
         model: mjx.Model,
         state: mjx.Data,
         controls: jax.Array,
         knots: jax.Array,
+        q_goal: jax.Array
     ) -> Tuple[mjx.Data, Trajectory]:
         """Rollout control sequences (in parallel) and compute the costs.
 
@@ -250,14 +254,14 @@ class SamplingBasedController(ABC):
             """Compute the cost and observation, then advance the state."""
             x = x.replace(ctrl=u)
             x = mjx.step(model, x)  # step model + compute site positions
-            cost = self.dt * self.task.running_cost(x, u)
+            cost = self.dt * self.task.running_cost(x, u, q_goal)
             sites = self.task.get_trace_sites(x)
             return x, (x, cost, sites)
 
         final_state, (states, costs, trace_sites) = jax.lax.scan(
             _scan_fn, state, controls
         )
-        final_cost = self.task.terminal_cost(final_state)
+        final_cost = self.task.terminal_cost(final_state, q_goal)
         final_trace_sites = self.task.get_trace_sites(final_state)
 
         costs = jnp.append(costs, final_cost)
