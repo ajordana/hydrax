@@ -123,7 +123,7 @@ class SamplingBasedController(ABC):
                 {key: 0 for key in randomizations.keys()}
             )
 
-    def optimize(self, state: mjx.Data, params: Any, q_goal) -> Tuple[Any, Trajectory]:
+    def optimize(self, state: mjx.Data, params: Any, q_goal, ref_left_foot_pos, ref_right_foot_pos, ref_left_hand_pos, ref_right_hand_pos) -> Tuple[Any, Trajectory]:
         """Perform an optimization step to update the policy parameters.
 
         Args:
@@ -144,6 +144,10 @@ class SamplingBasedController(ABC):
         params = params.replace(tk=new_tk, mean=new_mean)
 
         q_goal = jnp.array(q_goal)
+        ref_left_foot_pos = jnp.array(ref_left_foot_pos)
+        ref_right_foot_pos = jnp.array(ref_right_foot_pos)
+        ref_left_hand_pos = jnp.array(ref_left_hand_pos) 
+        ref_right_hand_pos = jnp.array(ref_right_hand_pos)
 
         def _optimize_scan_body(params: Any, _: Any):
             # Sample random control sequences from spline knots
@@ -156,7 +160,7 @@ class SamplingBasedController(ABC):
             # combining costs using self.risk_strategy.
             rng, dr_rng = jax.random.split(params.rng)
             rollouts = self.rollout_with_randomizations(
-                state, new_tk, knots, dr_rng, q_goal
+                state, new_tk, knots, dr_rng, q_goal, ref_left_foot_pos, ref_right_foot_pos, ref_left_hand_pos, ref_right_hand_pos
             )
             params = params.replace(rng=rng)
 
@@ -179,7 +183,8 @@ class SamplingBasedController(ABC):
         tk: jax.Array,
         knots: jax.Array,
         rng: jax.Array,
-        q_goal: jax.Array
+        q_goal: jax.Array,
+        ref_left_foot_pos, ref_right_foot_pos, ref_left_hand_pos, ref_right_hand_pos
     ) -> Trajectory:
         """Compute rollout costs, applying domain randomizations.
 
@@ -213,8 +218,8 @@ class SamplingBasedController(ABC):
         # Apply the control sequences, parallelized over both rollouts and
         # domain randomizations.
         _, rollouts = jax.vmap(
-            self.eval_rollouts, in_axes=(self.randomized_axes, 0, None, None, None)
-        )(self.model, states, controls, knots, q_goal)
+            self.eval_rollouts, in_axes=(self.randomized_axes, 0, None, None, None, None, None, None, None)
+        )(self.model, states, controls, knots, q_goal, ref_left_foot_pos, ref_right_foot_pos, ref_left_hand_pos, ref_right_hand_pos)
 
         # Combine the costs from different domain randomizations using the
         # specified risk strategy.
@@ -226,14 +231,14 @@ class SamplingBasedController(ABC):
             costs=costs, controls=controls, knots=knots, trace_sites=trace_sites
         )
 
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None))
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, None, None, None, None))
     def eval_rollouts(
         self,
         model: mjx.Model,
         state: mjx.Data,
         controls: jax.Array,
         knots: jax.Array,
-        q_goal: jax.Array
+        q_goal, ref_left_foot_pos, ref_right_foot_pos, ref_left_hand_pos, ref_right_hand_pos
     ) -> Tuple[mjx.Data, Trajectory]:
         """Rollout control sequences (in parallel) and compute the costs.
 
@@ -254,14 +259,14 @@ class SamplingBasedController(ABC):
             """Compute the cost and observation, then advance the state."""
             x = x.replace(ctrl=u)
             x = mjx.step(model, x)  # step model + compute site positions
-            cost = self.dt * self.task.running_cost(x, u, q_goal)
+            cost = self.dt * self.task.running_cost(x, u, q_goal, ref_left_foot_pos, ref_right_foot_pos, ref_left_hand_pos, ref_right_hand_pos)
             sites = self.task.get_trace_sites(x)
             return x, (x, cost, sites)
 
         final_state, (states, costs, trace_sites) = jax.lax.scan(
             _scan_fn, state, controls
         )
-        final_cost = self.task.terminal_cost(final_state, q_goal)
+        final_cost = self.task.terminal_cost(final_state, q_goal, ref_left_foot_pos, ref_right_foot_pos, ref_left_hand_pos, ref_right_hand_pos)
         final_trace_sites = self.task.get_trace_sites(final_state)
 
         costs = jnp.append(costs, final_cost)
